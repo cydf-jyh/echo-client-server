@@ -1,134 +1,123 @@
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
-#include <iostream>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <set>
 #include <thread>
-#include <vector>
-
+#include <mutex>
+#include <stdlib.h>
+#include <signal.h>
 using namespace std;
-vector<int> List;
-
-void usage() {
-	cout << "syntax: echo-server <port>[-e][-b]\n";
-	cout << "  -e : echo\n";
-	cout << "  -b : broadcast\n";
-	cout << "sample: echo-server 1234 -e -b\n";
-}
-
-struct Param {
-	bool echo{false};
-	bool broadcast{false};
-	uint16_t port{0};
-
-	bool parse(int argc, char* argv[]) {
-		for (int i = 1; i < argc; i++) {
-			if (strcmp(argv[i], "-e") == 0) {
-				echo = true;
-				continue;
-			}
-			if (strcmp(argv[i], "-b") == 0) {
-				broadcast = true;
-				continue;
-			}
-			port = stoi(argv[i++]);
+#define BUFFERSIZE 1024
+struct SetInt:set<int>{
+	mutex mut;
+	void lock(){mut.lock();}
+	void unlock(){mut.unlock();}
+};
+SetInt client_fd;
+bool broadcast = false;
+bool echo = false;
+void recvThread(int cli_sd){
+	printf("Connected and recvThread is working!\n");
+	char message[BUFFERSIZE];
+	while(true){
+		ssize_t res = recv(cli_sd, message, BUFFERSIZE - 1, 0);
+		if(res==0 || res==-1){
+			perror("recv failed");
+            break;
 		}
-		return port != 0;
-	}
-} param;
-
-void recvThread(int sd) {
-	cout << "connected"<<":"<<sd<<"\n";
-	static const int BUFSIZE = 65536;
-	char buf[BUFSIZE];
-	while (true) {
-		ssize_t res = recv(sd, buf, BUFSIZE - 1, 0);
-		if (res == 0 || res == -1) {
-			cerr << "recv return " << res << endl;
-			perror("recv");
-			break;
+		message[res] = '\0';
+		printf("message : %s\n",message);
+		if(echo == true && broadcast == false){
+			res = send(cli_sd, message, res, 0);
+			if(res == 0 || res == -1){
+				perror("send failed");
+	        	break;
+			}
 		}
-		buf[res] = '\0';
-		cout<< sd <<":"<<buf<<endl;
-
-		if (param.broadcast){
-			for(auto sd_in: List){
-				res = send(sd_in, buf, res, 0);
-				if(res == 0 || res == -1) {
-					cerr << "send return " << res << endl;
-					perror("send");
-					break;
+		if(echo == true && broadcast == true){
+			client_fd.lock();
+			printf("broadcast send to %d number of clients\n",(int)client_fd.size());
+			set<int>::iterator it;
+			for(it=client_fd.begin();it!=client_fd.end();){
+				res = send((*it), message, res, 0);
+				if(res == 0 || res == -1){
+					perror("send failed");
+					it = client_fd.erase(it);
+	            	continue;
 				}
+				it++;
 			}
-		}
-		if (param.echo) {
-			res = send(sd, buf, res, 0);
-			if (res == 0 || res == -1) {
-				cerr << "send return " << res << endl;
-				perror("send");
+			client_fd.unlock();
+			if(client_fd.find(cli_sd)==client_fd.end()){
 				break;
 			}
 		}
 	}
-	int i=0;
-	for(auto sd_in: List){
-		if(sd_in==sd)
-		{
-			List.erase(List.begin()+i);
-		}
-		i++;
+	if(broadcast==true){
+		client_fd.lock();
+		client_fd.erase(cli_sd);
+		client_fd.unlock();
 	}
-	cout << "disconnected"<<":"<<sd<<"\n";
-    close(sd);
+	close(cli_sd);
 }
-
-int main(int argc, char* argv[]) {
-	if (!param.parse(argc, argv)) {
-		usage();
+int main(int argc, char **argv) {
+	if (argc < 2 || argc > 4) {
+		printf("echo-server:\n");
+		printf("syntax : echo-server <port> [-e[-b]]\n");
+		printf("sample : echo-server 1234 -e -b \n");	
 		return -1;
 	}
-
-	int sd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sd == -1) {
+	if(argc >= 3){
+		echo = true;
+	}
+	if(argc == 4){
+		broadcast = true;
+	}
+	int server_socket;
+	int opt = 1;
+	struct sockaddr_in server_address;
+	server_socket = socket(AF_INET, SOCK_STREAM, 0);
+	if (server_socket == -1) {
 		perror("socket");
 		return -1;
 	}
-
-	int optval = 1;
-	int res = setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-	if (res == -1) {
+	if(setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))==-1){
 		perror("setsockopt");
 		return -1;
 	}
-
-	struct sockaddr_in addr;
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
-	addr.sin_port = htons(param.port);
-
-	ssize_t res2 = ::bind(sd, (struct sockaddr *)&addr, sizeof(addr));
-	if (res2 == -1) {
+	memset(&server_address, 0, sizeof(server_address));
+	server_address.sin_family = AF_INET;
+	server_address.sin_addr.s_addr = INADDR_ANY;
+	server_address.sin_port = htons(atoi(argv[1]));
+	if(bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address))==-1){
 		perror("bind");
 		return -1;
 	}
-
-	res = listen(sd, 5);
-	if (res == -1) {
+	if(listen(server_socket, 5)==-1){
 		perror("listen");
 		return -1;
 	}
 
-	while (true) {
-		struct sockaddr_in cli_addr;
-		socklen_t len = sizeof(cli_addr);
-		int cli_sd = accept(sd, (struct sockaddr *)&cli_addr, &len);
+	while(true){
+		struct sockaddr_in client_address;
+		socklen_t client_address_size = sizeof(client_address);
+		int cli_sd = accept(server_socket, (struct sockaddr*)&client_address, &client_address_size);
 		if (cli_sd == -1) {
 			perror("accept");
 			break;
 		}
-        List.push_back(cli_sd);
-		thread* t = new thread(recvThread, cli_sd);
-		t->detach();
+		if(broadcast==true){
+			client_fd.lock();
+			client_fd.insert(cli_sd);
+			client_fd.unlock();
+		}
+		thread* cl_th = new thread(recvThread, cli_sd);
+		cl_th->detach();
 	}
-	close(sd);
+	close(server_socket);
+	return 0;
 }
